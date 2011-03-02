@@ -34,10 +34,12 @@ usage of this module might look like this:
 """
 
 import cgi
-import hashlib
 import time
 import urllib
-
+import hashlib
+import hmac
+import base64
+import logging
 # Find a JSON parser
 try:
     import json
@@ -51,6 +53,7 @@ except ImportError:
         from django.utils import simplejson
         _parse_json = lambda s: simplejson.loads(s)
 
+from google.appengine.api import urlfetch
 
 class GraphAPI(object):
     """A client for the Facebook Graph API.
@@ -99,6 +102,9 @@ class GraphAPI(object):
     def get_connections(self, id, connection_name, **args):
         """Fetchs the connections for given object."""
         return self.request(id + "/" + connection_name, args)
+    
+    def call_rest(self,method,**kwargs):
+        return self.rest_request(method, kwargs)
 
     def put_object(self, parent_object, connection_name, **data):
         """Writes the given object to the graph, connected to the given parent.
@@ -154,7 +160,22 @@ class GraphAPI(object):
     def delete_object(self, id):
         """Deletes the object with the given ID from the graph."""
         self.request(id, post_args={"method": "delete"})
-
+    def rest_request(self,method,args):
+        """Runs the specified query against the Facebook FQL API.
+        """
+        args['format'] = 'JSON'
+        if self.access_token:
+            args["access_token"] = self.access_token
+        logging.info('https://api.facebook.com/method/%s?%s'%(method,urllib.urlencode(args)))
+        response = urlfetch.fetch('https://api.facebook.com/method/%s?%s'%(method,urllib.urlencode(args)))
+        try:
+            response = _parse_json(response.content)
+        finally:
+            pass
+        if isinstance( response, dict ) and response.has_key( 'error_msg' ):
+            raise Exception( response[ 'error_msg' ] )
+    
+        return response
     def request(self, path, args=None, post_args=None):
         """Fetches the given path in the Graph API.
 
@@ -178,12 +199,14 @@ class GraphAPI(object):
             raise GraphAPIError(response["error"]["type"],
                                 response["error"]["message"])
         return response
-
+        
 
 class GraphAPIError(Exception):
     def __init__(self, type, message):
         Exception.__init__(self, message)
         self.type = type
+
+
 
 
 def get_user_from_cookie(cookies, app_id, app_secret):
@@ -212,3 +235,27 @@ def get_user_from_cookie(cookies, app_id, app_secret):
         return args
     else:
         return None
+
+def parse_signed_request(signed_request, app_secret):
+    """Return dictionary with signed request data."""
+    try:
+      l = signed_request.split('.', 2)
+      encoded_sig = str(l[0])
+      payload = str(l[1])
+    except IndexError:
+      raise ValueError("'signed_request' malformed")
+    
+    sig = base64.urlsafe_b64decode(encoded_sig + "=" * ((4 - len(encoded_sig) % 4) % 4))
+    data = base64.urlsafe_b64decode(payload + "=" * ((4 - len(payload) % 4) % 4))
+
+    data = _parse_json(data)
+
+    if data.get('algorithm').upper() != 'HMAC-SHA256':
+      raise ValueError("'signed_request' is using an unknown algorithm")
+    else:
+      expected_sig = hmac.new(app_secret, msg=payload, digestmod=hashlib.sha256).digest()
+
+    if sig != expected_sig:
+      raise ValueError("'signed_request' signature mismatch")
+    else:
+      return data
